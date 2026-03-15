@@ -1,0 +1,2 @@
+trezor>=0.13
+cryptography>=42.0
