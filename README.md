@@ -2,19 +2,23 @@
 
 Hardware-backed Certificate Authority and JWT signing using a Trezor hardware wallet.
 
-Uses the `SignIdentity` firmware feature (SLIP-0013) with `gpg://` URIs to produce raw Ed25519 signatures suitable for X.509 certificates and JWTs.
+Uses the `SignIdentity` firmware feature (SLIP-0013) with `gpg://` URIs to produce raw signatures suitable for X.509 certificates and JWTs. Supports both `ed25519` and `nist256p1` (P-256) curves — use P-256 for browser-compatible CA certificates.
 
 ## How it works
 
-`SignIdentity` with the `gpg://` protocol passes `challenge_hidden` bytes directly to the Ed25519 signing function on the device with no additional framing:
+`SignIdentity` with the `gpg://` protocol passes `challenge_hidden` bytes directly to the signing function with no additional framing:
 
 ```python
 # Trezor firmware (sign_identity.py)
 if sigtype == "gpg":
-    data = challenge_hidden
+    data = challenge_hidden          # no pre-hashing by firmware
 if curve == "ed25519":
-    signature = ed25519.sign(seckey, data)
+    signature = ed25519.sign(seckey, data)   # hashes internally — any length OK
+elif curve == "nist256p1":
+    signature = nist256p1.sign(seckey, data) # requires exactly 32 bytes
 ```
+
+For `nist256p1`, `trezor-pki.py` SHA-256 hashes the TBS bytes before passing them to the firmware, matching the `ecdsa-with-SHA256` algorithm declared in the certificate.
 
 Key derivation is deterministic via SLIP-0013: a `gpg://` URI is hashed into a BIP-32 path. Same seed + same URI always produces the same key pair. Different URIs produce independent key pairs.
 
@@ -29,7 +33,7 @@ pip install trezor cryptography
 - Python 3.8+
 - Trezor with `SignIdentity` support (Safe 3, Safe 5, Model T, Model One)
 - Firmware 2.10.0+ recommended for Safe 3
-- Ed25519 curve only (`nist256p1` returns `FirmwareError` on Safe 3 as of firmware 2.10.0)
+- Both `ed25519` and `nist256p1` supported on Safe 3 (use `nist256p1` for browser-compatible certs)
 
 ### WSL2 USB passthrough
 
@@ -55,7 +59,16 @@ Trezor Suite must be closed on Windows before attaching. Permissions must be res
 
 ### Initialize a CA
 
+Use `--curve nist256p1` for a browser-compatible CA (ecdsa-with-SHA256). Use `ed25519` for infrastructure-only (containerd, curl, Docker) where browser trust is not needed.
+
 ```bash
+# Browser-compatible (recommended)
+python trezor-pki.py --curve nist256p1 init-ca \
+  --uri "gpg://ca@yourdomain" \
+  --cn "My CA" \
+  -o ca.crt
+
+# Ed25519 (infrastructure only — not trusted by Firefox/Chrome in cert chains)
 python trezor-pki.py init-ca \
   --uri "gpg://ca@yourdomain" \
   --cn "My CA" \
@@ -77,8 +90,10 @@ python trezor-pki.py gen-csr \
 
 ### Sign a CSR
 
+Use the same `--curve` flag as when you created the CA.
+
 ```bash
-python trezor-pki.py sign-csr \
+python trezor-pki.py --curve nist256p1 sign-csr \
   --uri "gpg://ca@yourdomain" \
   --ca-cert ca.crt \
   --csr service.csr \
@@ -123,7 +138,8 @@ Each URI derives an independent key pair from the same seed:
 ## Findings
 
 - `SignIdentity` with `gpg://` sigtype is the only Trezor signing path that produces raw, unframed signatures. Bitcoin `signMessage` adds a message prefix, Cardano CIP-8 wraps in COSE_Sign1, and Solana does not support message signing.
-- `nist256p1` returns `FirmwareError` on the Trezor Safe 3 (tested on firmware 2.6.4 and 2.10.0). `ed25519` works correctly.
+- `nist256p1` works on Safe 3 but requires the `challenge_hidden` to be exactly 32 bytes — the firmware passes it directly to the ECDSA sign function which enforces this. `trezor-pki.py` handles this automatically by SHA-256 hashing the input before signing.
+- `ed25519` CA certificates are rejected by Firefox and Chrome in TLS chain verification (`SEC_ERROR_CERT_SIGNATURE_ALGORITHM_DISABLED` / `ERR_CERT_INVALID`). This is a browser limitation with no workaround — use `nist256p1` if browser trust is needed.
 - trezorlib 0.20+ requires `AppManifest` + `get_client()` + `client.get_session()`. The older `TrezorClient(transport, ui=...)` pattern no longer works.
 - The `challenge_hidden` field supports up to 512 bytes.
 
@@ -131,7 +147,7 @@ Each URI derives an independent key pair from the same seed:
 
 | Model | Firmware | ed25519 | nist256p1 |
 |-------|----------|---------|-----------|
-| Safe 3 (T2B1) | 2.10.0 | ✅ | ❌ FirmwareError |
+| Safe 3 (T2B1) | 2.10.0 | ✅ | ✅ |
 | Model T | 2.1.0+ | Untested | Untested |
 | Safe 5 | All | Untested | Untested |
 | Model One | 1.3.4+ | Untested | Untested |

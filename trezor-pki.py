@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
-    from trezorlib import misc, messages, ui
+    from trezorlib import exceptions, misc, messages, ui
     from trezorlib.client import get_client as _trezor_get_client, AppManifest
     from trezorlib.transport import get_transport
 except ImportError:
@@ -100,6 +100,42 @@ def make_identity(uri: str) -> messages.IdentityType:
     )
 
 
+def _curve_candidates(curve: str) -> list[str]:
+    """Return firmware curve-name candidates in preferred order."""
+    if curve == "nist256p1":
+        # Some firmware/tooling paths use secp256r1 for the same curve.
+        return ["nist256p1", "secp256r1"]
+    return [curve]
+
+
+def _sign_identity_with_curve_fallback(session, identity, challenge_hidden: bytes, curve: str):
+    """Call SignIdentity with curve alias fallback for nist256p1 firmware quirks."""
+    last_error = None
+    for curve_name in _curve_candidates(curve):
+        try:
+            return misc.sign_identity(
+                session,
+                identity=identity,
+                challenge_hidden=challenge_hidden,
+                challenge_visual="",
+                ecdsa_curve_name=curve_name,
+            )
+        except exceptions.TrezorFailure as err:
+            last_error = err
+            # Try next alias only for firmware-level failure.
+            if "FirmwareError" not in str(err):
+                raise
+
+    # We exhausted aliases. Give an actionable error message.
+    if curve == "nist256p1":
+        raise RuntimeError(
+            "Trezor firmware rejected nist256p1 SignIdentity on this device/firmware. "
+            "Tried curve names: nist256p1, secp256r1. "
+            "Please upgrade firmware or use --curve ed25519."
+        ) from last_error
+    raise last_error
+
+
 def trezor_sign(session, uri: str, data: bytes, curve: str = "ed25519") -> tuple:
     """
     Sign arbitrary data using Trezor's SignIdentity.
@@ -114,16 +150,13 @@ def trezor_sign(session, uri: str, data: bytes, curve: str = "ed25519") -> tuple
 
     # For gpg sigtype: data = challenge_hidden (passed directly to sign function)
     # Ed25519 hashes internally, so we pass raw data.
-    # For ECDSA curves, the firmware's sign() also handles hashing internally.
-    challenge = data
+    # For nist256p1, the firmware expects a 32-byte SHA-256 hash as input.
+    if curve == "nist256p1":
+        challenge = hashlib.sha256(data).digest()
+    else:
+        challenge = data
 
-    result = misc.sign_identity(
-        session,
-        identity=identity,
-        challenge_hidden=challenge,
-        challenge_visual="",
-        ecdsa_curve_name=curve,
-    )
+    result = _sign_identity_with_curve_fallback(session, identity, challenge, curve)
 
     # Result signature format:
     # - ed25519: b'\x00' + 64-byte signature
@@ -137,15 +170,10 @@ def trezor_sign(session, uri: str, data: bytes, curve: str = "ed25519") -> tuple
 def get_public_key(session, uri: str, curve: str = "ed25519") -> bytes:
     """Get the public key for a given identity URI without signing anything meaningful."""
     identity = make_identity(uri)
-    # Sign a dummy challenge just to get the public key
-    dummy = b"\x00" * 32
-    result = misc.sign_identity(
-        session,
-        identity=identity,
-        challenge_hidden=dummy,
-        challenge_visual="",
-        ecdsa_curve_name=curve,
-    )
+    # Sign a deterministic dummy challenge just to get the public key.
+    # Safe 3 firmware rejects an all-zero challenge for nist256p1.
+    dummy = hashlib.sha256(f"trezor-pki:get-public-key:{uri}".encode("utf-8")).digest()
+    result = _sign_identity_with_curve_fallback(session, identity, dummy, curve)
     return result.public_key
 
 
