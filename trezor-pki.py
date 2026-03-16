@@ -15,8 +15,9 @@ Supports:
 Requires: pip install trezor cryptography
 
 Curve support:
-  - nist256p1 (P-256) → ES256 JWTs, ECDSA X.509 certs (widest TLS compat)
-  - ed25519 → EdDSA JWTs, Ed25519 X.509 certs
+  - nist256p1 (P-256)  → ES256 JWTs, ECDSA X.509 certs (widest TLS compat)
+  - secp256k1 (K-256)  → ES256K JWTs, ECDSA X.509 certs (Bitcoin curve)
+  - ed25519            → EdDSA JWTs, Ed25519 X.509 certs
 """
 
 import argparse
@@ -151,7 +152,7 @@ def trezor_sign(session, uri: str, data: bytes, curve: str = "ed25519") -> tuple
     # For gpg sigtype: data = challenge_hidden (passed directly to sign function)
     # Ed25519 hashes internally, so we pass raw data.
     # For nist256p1, the firmware expects a 32-byte SHA-256 hash as input.
-    if curve == "nist256p1":
+    if curve in ("nist256p1", "secp256k1"):
         challenge = hashlib.sha256(data).digest()
     else:
         challenge = data
@@ -192,6 +193,8 @@ def pubkey_to_crypto_key(pubkey_bytes: bytes, curve: str):
     if curve == "nist256p1":
         # Trezor returns compressed SEC1 format (33 bytes, starting with 02 or 03)
         return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey_bytes)
+    elif curve == "secp256k1":
+        return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), pubkey_bytes)
     elif curve == "ed25519":
         # Strip 0x00 prefix
         raw_key = pubkey_bytes[1:] if pubkey_bytes[0] == 0 else pubkey_bytes
@@ -208,8 +211,8 @@ def trezor_signature_to_der(sig_bytes: bytes, curve: str) -> bytes:
     X.509 needs DER-encoded ECDSA signature.
     For Ed25519, signature is raw 64 bytes (after stripping prefix).
     """
-    if curve == "nist256p1":
-        # Strip leading 0x00
+    if curve in ("nist256p1", "secp256k1"):
+        # Strip leading 0x00, then encode r||s as DER
         raw = sig_bytes[1:]
         r = int.from_bytes(raw[:32], "big")
         s = int.from_bytes(raw[32:64], "big")
@@ -303,6 +306,9 @@ def _get_tbs_bytes(builder, curve: str) -> bytes:
     if curve == "nist256p1":
         dummy_key = ec.generate_private_key(ec.SECP256R1())
         dummy_cert = builder.sign(dummy_key, hashes.SHA256())
+    elif curve == "secp256k1":
+        dummy_key = ec.generate_private_key(ec.SECP256K1())
+        dummy_cert = builder.sign(dummy_key, hashes.SHA256())
     elif curve == "ed25519":
         dummy_key = ed25519.Ed25519PrivateKey.generate()
         dummy_cert = builder.sign(dummy_key, None)
@@ -374,8 +380,9 @@ def _assemble_cert_der(tbs_bytes: bytes, signature: bytes, curve: str) -> bytes:
         return bytes([0x06]) + encode_length(len(oid_bytes)) + oid_bytes
 
     # Algorithm identifiers
-    if curve == "nist256p1":
+    if curve in ("nist256p1", "secp256k1"):
         # ecdsa-with-SHA256: 1.2.840.10045.4.3.2
+        # (curve is encoded in the SubjectPublicKeyInfo, not the sig alg OID)
         oid = bytes([0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02])
         sig_alg = encode_sequence(encode_oid(oid))
     elif curve == "ed25519":
@@ -481,6 +488,8 @@ def sign_jwt(session, uri: str, claims: dict, curve: str = "ed25519",
     """
     if curve == "nist256p1":
         alg = "ES256"
+    elif curve == "secp256k1":
+        alg = "ES256K"
     elif curve == "ed25519":
         alg = "EdDSA"
     else:
@@ -498,8 +507,8 @@ def sign_jwt(session, uri: str, claims: dict, curve: str = "ed25519",
     # Convert signature to JWS format
     raw_sig = sig[1:]  # strip 0x00 prefix
 
-    if curve == "nist256p1":
-        # ES256: r || s, each 32 bytes (already in this format from Trezor)
+    if curve in ("nist256p1", "secp256k1"):
+        # ES256 / ES256K: r || s, each 32 bytes (already in this format from Trezor)
         jws_sig = b64url(raw_sig[:64])
     elif curve == "ed25519":
         # EdDSA: raw 64-byte signature
@@ -524,6 +533,18 @@ def export_jwk(session, uri: str, curve: str = "ed25519") -> dict:
             "y": b64url(y_bytes),
             "use": "sig",
             "alg": "ES256",
+        }
+    elif curve == "secp256k1":
+        numbers = crypto_pubkey.public_numbers()
+        x_bytes = numbers.x.to_bytes(32, "big")
+        y_bytes = numbers.y.to_bytes(32, "big")
+        return {
+            "kty": "EC",
+            "crv": "secp256k1",
+            "x": b64url(x_bytes),
+            "y": b64url(y_bytes),
+            "use": "sig",
+            "alg": "ES256K",
         }
     elif curve == "ed25519":
         raw = pubkey[1:] if pubkey[0] == 0 else pubkey
@@ -675,8 +696,8 @@ Examples:
     )
 
     parser.add_argument("--curve", default="ed25519",
-                        choices=["nist256p1", "ed25519"],
-                        help="Elliptic curve (default: nist256p1 for widest TLS compat)")
+                        choices=["nist256p1", "secp256k1", "ed25519"],
+                        help="Elliptic curve (default: ed25519)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
